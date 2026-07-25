@@ -11,6 +11,19 @@ import warnings
 import datetime
 warnings.filterwarnings('ignore')
 
+# Use the local proxy for Hugging Face/model downloads while keeping local APIs direct.
+DOWNLOAD_PROXY = os.environ.get('MT5_DEMO_PROXY', 'http://127.0.0.1:7897')
+os.environ.setdefault('HTTP_PROXY', DOWNLOAD_PROXY)
+os.environ.setdefault('HTTPS_PROXY', DOWNLOAD_PROXY)
+os.environ.setdefault('NO_PROXY', '127.0.0.1,localhost')
+
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    mt5 = None
+    MT5_AVAILABLE = False
+
 # Add project root directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -29,6 +42,104 @@ tokenizer = None
 model = None
 predictor = None
 
+MT5_TIMEFRAMES = {
+    'M1': mt5.TIMEFRAME_M1 if MT5_AVAILABLE else None,
+    'M5': mt5.TIMEFRAME_M5 if MT5_AVAILABLE else None,
+    'M15': mt5.TIMEFRAME_M15 if MT5_AVAILABLE else None,
+    'M30': mt5.TIMEFRAME_M30 if MT5_AVAILABLE else None,
+    'H1': mt5.TIMEFRAME_H1 if MT5_AVAILABLE else None,
+    'H4': mt5.TIMEFRAME_H4 if MT5_AVAILABLE else None,
+    'D1': mt5.TIMEFRAME_D1 if MT5_AVAILABLE else None,
+    'W1': mt5.TIMEFRAME_W1 if MT5_AVAILABLE else None,
+}
+
+MT5_TIMEFRAME_MINUTES = {
+    'M1': 1, 'M5': 5, 'M15': 15, 'M30': 30,
+    'H1': 60, 'H4': 240, 'D1': 1440, 'W1': 10080,
+}
+
+
+def ensure_mt5_connection():
+    """Initialize the local MetaTrader 5 terminal connection."""
+    if not MT5_AVAILABLE:
+        return False, 'MetaTrader5 Python package is not installed'
+    if mt5.terminal_info() is not None:
+        return True, None
+    if not mt5.initialize():
+        code, message = mt5.last_error()
+        return False, f'MT5 initialization failed ({code}): {message}'
+    return True, None
+
+
+def parse_utc_datetime(value, field_name):
+    if not value:
+        raise ValueError(f'{field_name} cannot be empty')
+    parsed = pd.to_datetime(value, utc=True)
+    return parsed.to_pydatetime()
+
+
+def align_to_timeframe(value, timeframe):
+    """Floor a UTC datetime to a valid boundary for the MT5 timeframe."""
+    timestamp = pd.Timestamp(value).tz_convert('UTC')
+    if timeframe == 'W1':
+        timestamp = (timestamp - pd.Timedelta(days=timestamp.weekday())).normalize()
+    elif timeframe == 'D1':
+        timestamp = timestamp.normalize()
+    else:
+        timestamp = timestamp.floor(f'{MT5_TIMEFRAME_MINUTES[timeframe]}min')
+    return timestamp.to_pydatetime()
+
+
+def load_mt5_data(symbol, timeframe, date_from, date_to):
+    """Fetch OHLCV bars from MT5 using a UTC date range."""
+    connected, error = ensure_mt5_connection()
+    if not connected:
+        return None, error
+    if not symbol:
+        return None, 'Symbol cannot be empty'
+    if timeframe not in MT5_TIMEFRAMES:
+        return None, f'Unsupported timeframe: {timeframe}'
+
+    try:
+        start = align_to_timeframe(parse_utc_datetime(date_from, 'Start time'), timeframe)
+        end = align_to_timeframe(parse_utc_datetime(date_to, 'End time'), timeframe)
+    except (ValueError, TypeError) as exc:
+        return None, str(exc)
+    if start >= end:
+        return None, 'Start time must be earlier than end time'
+
+    if not mt5.symbol_select(symbol, True):
+        code, message = mt5.last_error()
+        return None, f'Unable to select symbol {symbol} ({code}): {message}'
+
+    rates = mt5.copy_rates_range(symbol, MT5_TIMEFRAMES[timeframe], start, end)
+    if rates is None:
+        code, message = mt5.last_error()
+        return None, f'Failed to fetch MT5 rates ({code}): {message}'
+    if len(rates) == 0:
+        return None, 'MT5 returned no bars for this symbol and time range'
+
+    df = pd.DataFrame(rates)
+    df['timestamps'] = pd.to_datetime(df['time'], unit='s', utc=True).dt.tz_localize(None)
+    df['volume'] = pd.to_numeric(df['tick_volume'], errors='coerce').fillna(0)
+    df = df[['timestamps', 'open', 'high', 'low', 'close', 'volume']]
+    df = df.sort_values('timestamps').drop_duplicates('timestamps').dropna().reset_index(drop=True)
+    return df, None
+
+
+def load_request_data(data):
+    if data.get('source', 'mt5') == 'mt5':
+        return load_mt5_data(
+            data.get('symbol'),
+            data.get('timeframe'),
+            data.get('date_from'),
+            data.get('date_to'),
+        )
+    file_path = data.get('file_path')
+    if not file_path:
+        return None, 'File path cannot be empty'
+    return load_data_file(file_path)
+
 # Available model configurations
 AVAILABLE_MODELS = {
     'kronos-mini': {
@@ -37,7 +148,7 @@ AVAILABLE_MODELS = {
         'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-2k',
         'context_length': 2048,
         'params': '4.1M',
-        'description': 'Lightweight model, suitable for fast prediction'
+        'description': '轻量模型，适合快速预测'
     },
     'kronos-small': {
         'name': 'Kronos-small',
@@ -45,7 +156,7 @@ AVAILABLE_MODELS = {
         'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
         'context_length': 512,
         'params': '24.7M',
-        'description': 'Small model, balanced performance and speed'
+        'description': '小型模型，兼顾效果与速度'
     },
     'kronos-base': {
         'name': 'Kronos-base',
@@ -53,7 +164,7 @@ AVAILABLE_MODELS = {
         'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
         'context_length': 512,
         'params': '102.3M',
-        'description': 'Base model, provides better prediction quality'
+        'description': '基础模型，提供更高预测质量'
     }
 }
 
@@ -206,7 +317,7 @@ def save_prediction_results(file_path, prediction_type, prediction_results, actu
         print(f"Failed to save prediction results: {e}")
         return None
 
-def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, historical_start_idx=0):
+def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, historical_start_idx=0, prediction_timestamps=None):
     """Create prediction chart"""
     # Use specified historical data start position, not always from the beginning of df
     if historical_start_idx + lookback + pred_len <= len(df):
@@ -230,9 +341,11 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
         high=historical_df['high'],
         low=historical_df['low'],
         close=historical_df['close'],
-        name='Historical Data (400 data points)',
-        increasing_line_color='#26A69A',
-        decreasing_line_color='#EF5350'
+        name='历史数据（400根）',
+        increasing_fillcolor='#FFFFFF',
+        increasing_line_color='#111111',
+        decreasing_fillcolor='#111111',
+        decreasing_line_color='#111111'
     ))
     
     # Add prediction data (candlestick chart)
@@ -243,7 +356,7 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
             last_timestamp = historical_df['timestamps'].iloc[-1]
             time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0] if len(df) > 1 else pd.Timedelta(hours=1)
             
-            pred_timestamps = pd.date_range(
+            pred_timestamps = prediction_timestamps if prediction_timestamps is not None else pd.date_range(
                 start=last_timestamp + time_diff,
                 periods=len(pred_df),
                 freq=time_diff
@@ -258,9 +371,11 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
             high=pred_df['high'],
             low=pred_df['low'],
             close=pred_df['close'],
-            name='Prediction Data (120 data points)',
-            increasing_line_color='#66BB6A',
-            decreasing_line_color='#FF7043'
+            name='预测数据（120根）',
+            increasing_fillcolor='#E53935',
+            increasing_line_color='#E53935',
+            decreasing_fillcolor='#1B9E4B',
+            decreasing_line_color='#1B9E4B'
         ))
     
     # Add actual data for comparison (if exists)
@@ -291,19 +406,35 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
             high=actual_df['high'],
             low=actual_df['low'],
             close=actual_df['close'],
-            name='Actual Data (120 data points)',
-            increasing_line_color='#FF9800',
-            decreasing_line_color='#F44336'
+            name='实际数据（120根）',
+            increasing_fillcolor='#FFFFFF',
+            increasing_line_color='#111111',
+            decreasing_fillcolor='#111111',
+            decreasing_line_color='#111111'
         ))
     
+    chart_title = (
+        f'Kronos 未来K线预测：最新 {lookback} 根历史 + 未来 {pred_len} 根预测'
+        if actual_df is None else
+        'Kronos K线预测结果：400根历史 + 120根预测与实际对比'
+    )
+
     # Update layout
     fig.update_layout(
-        title='Kronos Financial Prediction Results - 400 Historical Points + 120 Prediction Points vs 120 Actual Points',
-        xaxis_title='Time',
-        yaxis_title='Price',
+        title=chart_title,
+        xaxis_title='时间',
+        yaxis_title='价格',
         template='plotly_white',
-        height=600,
-        showlegend=True
+        height=650,
+        showlegend=True,
+        margin=dict(l=65, r=25, t=105, b=60),
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='right',
+            x=1
+        )
     )
     
     # Ensure x-axis time continuity
@@ -327,6 +458,99 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
     
     return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
 
+
+def generate_future_timestamps(last_timestamp, timeframe, count, symbol):
+    """Generate future MT5 bar opens, skipping weekends for non-crypto symbols."""
+    minutes = MT5_TIMEFRAME_MINUTES.get(timeframe)
+    if not minutes:
+        raise ValueError(f'不支持的时间周期：{timeframe}')
+    delta = pd.Timedelta(minutes=minutes)
+    current = pd.Timestamp(last_timestamp)
+    timestamps = []
+    is_crypto = any(token in (symbol or '').upper() for token in ('BTC', 'ETH', 'CRYPTO'))
+    while len(timestamps) < count:
+        current += delta
+        if not is_crypto and current.weekday() >= 5:
+            continue
+        timestamps.append(current)
+    return pd.DatetimeIndex(timestamps)
+
+
+def predict_future(data, df, lookback, pred_len, temperature, top_p, sample_count):
+    if not MODEL_AVAILABLE or predictor is None:
+        return jsonify({'error': 'Kronos 模型尚未加载，请先加载模型'}), 400
+    if len(df) < lookback:
+        return jsonify({
+            'error': f'行情数量不足：未来预测需要最新 {lookback} 根K线，当前只有 {len(df)} 根。',
+            'rows': len(df),
+            'required_rows': lookback,
+        }), 400
+
+    required_cols = ['open', 'high', 'low', 'close']
+    if 'volume' in df.columns:
+        required_cols.append('volume')
+    historical_start_idx = len(df) - lookback
+    x_df = df.iloc[historical_start_idx:][required_cols].reset_index(drop=True)
+    x_timestamp = df.iloc[historical_start_idx:]['timestamps'].reset_index(drop=True)
+    future_timestamps = generate_future_timestamps(
+        x_timestamp.iloc[-1], data.get('timeframe'), pred_len, data.get('symbol')
+    )
+    y_timestamp = pd.Series(future_timestamps, name='timestamps')
+
+    try:
+        pred_df = predictor.predict(
+            df=x_df,
+            x_timestamp=x_timestamp,
+            y_timestamp=y_timestamp,
+            pred_len=pred_len,
+            T=temperature,
+            top_p=top_p,
+            sample_count=sample_count
+        )
+    except Exception as exc:
+        return jsonify({'error': f'Kronos 未来预测失败：{str(exc)}'}), 500
+
+    prediction_results = []
+    for i, (_, row) in enumerate(pred_df.iterrows()):
+        prediction_results.append({
+            'timestamp': future_timestamps[i].isoformat(),
+            'open': float(row['open']),
+            'high': float(row['high']),
+            'low': float(row['low']),
+            'close': float(row['close']),
+            'volume': float(row['volume']) if 'volume' in row else 0,
+            'amount': float(row['amount']) if 'amount' in row else 0
+        })
+
+    prediction_type = f'{data.get("symbol")} {data.get("timeframe")} 未来 {pred_len} 根K线预测'
+    chart_json = create_prediction_chart(
+        df, pred_df, lookback, pred_len,
+        actual_df=None,
+        historical_start_idx=historical_start_idx,
+        prediction_timestamps=future_timestamps
+    )
+    save_prediction_results(
+        file_path=f'MT5:{data.get("symbol")}:{data.get("timeframe")}',
+        prediction_type=prediction_type,
+        prediction_results=prediction_results,
+        actual_data=[],
+        input_data=x_df,
+        prediction_params={
+            'mode': 'future', 'lookback': lookback, 'pred_len': pred_len,
+            'temperature': temperature, 'top_p': top_p, 'sample_count': sample_count,
+            'symbol': data.get('symbol'), 'timeframe': data.get('timeframe')
+        }
+    )
+    return jsonify({
+        'success': True,
+        'prediction_type': prediction_type,
+        'chart': chart_json,
+        'prediction_results': prediction_results,
+        'actual_data': [],
+        'has_comparison': False,
+        'message': f'未来预测完成：已基于最新 {lookback} 根K线生成未来 {pred_len} 根预测K线'
+    })
+
 @app.route('/')
 def index():
     """Home page"""
@@ -338,17 +562,85 @@ def get_data_files():
     data_files = load_data_files()
     return jsonify(data_files)
 
+
+@app.route('/api/mt5/status')
+def mt5_status():
+    connected, error = ensure_mt5_connection()
+    if not connected:
+        return jsonify({'available': MT5_AVAILABLE, 'connected': False, 'error': error}), 503
+    terminal = mt5.terminal_info()
+    account = mt5.account_info()
+    return jsonify({
+        'available': True,
+        'connected': True,
+        'terminal': terminal.name if terminal else None,
+        'company': terminal.company if terminal else None,
+        'account': account.login if account else None,
+        'server': account.server if account else None,
+        'timeframes': list(MT5_TIMEFRAMES.keys()),
+    })
+
+
+@app.route('/api/mt5/symbols')
+def mt5_symbols():
+    connected, error = ensure_mt5_connection()
+    if not connected:
+        return jsonify({'error': error}), 503
+    symbols = mt5.symbols_get()
+    if symbols is None:
+        code, message = mt5.last_error()
+        return jsonify({'error': f'Failed to read MT5 symbols ({code}): {message}'}), 500
+    visible_only = request.args.get('visible', 'true').lower() != 'false'
+    result = [item.name for item in symbols if not visible_only or item.visible]
+    return jsonify({'symbols': sorted(result), 'count': len(result)})
+
+
+@app.route('/api/mt5/symbol-info')
+def mt5_symbol_info():
+    connected, error = ensure_mt5_connection()
+    if not connected:
+        return jsonify({'error': error}), 503
+    symbol = request.args.get('symbol', '').strip()
+    if not symbol:
+        return jsonify({'error': 'Symbol cannot be empty'}), 400
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        code, message = mt5.last_error()
+        return jsonify({'error': f'Failed to read symbol information ({code}): {message}'}), 404
+    tick = mt5.symbol_info_tick(symbol)
+    trade_modes = {
+        mt5.SYMBOL_TRADE_MODE_DISABLED: 'Disabled',
+        mt5.SYMBOL_TRADE_MODE_LONGONLY: 'Long only',
+        mt5.SYMBOL_TRADE_MODE_SHORTONLY: 'Short only',
+        mt5.SYMBOL_TRADE_MODE_CLOSEONLY: 'Close only',
+        mt5.SYMBOL_TRADE_MODE_FULL: 'Full access',
+    }
+    return jsonify({
+        'symbol': symbol,
+        'description': info.description,
+        'currency_base': info.currency_base,
+        'currency_profit': info.currency_profit,
+        'digits': info.digits,
+        'point': info.point,
+        'bid': tick.bid if tick else info.bid,
+        'ask': tick.ask if tick else info.ask,
+        'spread': info.spread,
+        'spread_float': info.spread_float,
+        'contract_size': info.trade_contract_size,
+        'volume_min': info.volume_min,
+        'volume_max': info.volume_max,
+        'volume_step': info.volume_step,
+        'stops_level': info.trade_stops_level,
+        'freeze_level': info.trade_freeze_level,
+        'trade_mode': trade_modes.get(info.trade_mode, str(info.trade_mode)),
+    })
+
 @app.route('/api/load-data', methods=['POST'])
 def load_data():
-    """Load data file"""
+    """Load market data from MT5 (or a legacy local file)."""
     try:
         data = request.get_json()
-        file_path = data.get('file_path')
-        
-        if not file_path:
-            return jsonify({'error': 'File path cannot be empty'}), 400
-        
-        df, error = load_data_file(file_path)
+        df, error = load_request_data(data)
         if error:
             return jsonify({'error': error}), 400
         
@@ -389,17 +681,25 @@ def load_data():
                 'max': float(df[['open', 'high', 'low', 'close']].max().max())
             },
             'prediction_columns': ['open', 'high', 'low', 'close'] + (['volume'] if 'volume' in df.columns else []),
-            'timeframe': detect_timeframe(df)
+            'timeframe': data.get('timeframe') or detect_timeframe(df),
+            'symbol': data.get('symbol'),
+            'source': data.get('source', 'mt5'),
+            'required_rows': 400,
+            'sufficient_for_prediction': len(df) >= 400
         }
         
         return jsonify({
             'success': True,
             'data_info': data_info,
-            'message': f'Successfully loaded data, total {len(df)} rows'
+            'message': (
+                f'已从 {data.get("symbol", "数据源")} 加载 {len(df)} 根K线'
+                if len(df) >= 400 else
+                f'仅加载到 {len(df)} 根K线；未来预测至少需要 400 根，请扩大时间范围。'
+            )
         })
         
     except Exception as e:
-        return jsonify({'error': f'Failed to load data: {str(e)}'}), 500
+        return jsonify({'error': f'加载行情失败：{str(e)}'}), 500
 
 @app.route('/api/predict', methods=['POST'])
 def predict():
@@ -415,16 +715,41 @@ def predict():
         top_p = float(data.get('top_p', 0.9))
         sample_count = int(data.get('sample_count', 1))
         
-        if not file_path:
-            return jsonify({'error': 'File path cannot be empty'}), 400
-        
-        # Load data
-        df, error = load_data_file(file_path)
+        # Load the same MT5 range that was previewed in the UI.
+        df, error = load_request_data(data)
         if error:
             return jsonify({'error': error}), 400
+
+        if data.get('prediction_mode', 'future') == 'future':
+            return predict_future(data, df, lookback, pred_len, temperature, top_p, sample_count)
         
-        if len(df) < lookback:
-            return jsonify({'error': f'Insufficient data length, need at least {lookback} rows'}), 400
+        required_rows = lookback + pred_len
+        if len(df) < required_rows:
+            return jsonify({
+                'error': (
+                    f'行情数量不足：MT5 返回 {len(df)} 根K线，但预测需要 '
+                    f'{lookback} 根历史 + {pred_len} 根对比 = {required_rows} 根。'
+                    '请扩大所选时间范围。'
+                ),
+                'rows': len(df),
+                'required_rows': required_rows,
+            }), 400
+
+        # Select the backtest window by bar index. Calendar-time percentages are
+        # unreliable for MT5 data because weekends and trading pauses create gaps.
+        requested_start_index = data.get('start_index')
+        if requested_start_index is not None:
+            try:
+                start_index = int(requested_start_index)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'K线窗口起始索引必须是整数'}), 400
+            max_start_index = len(df) - required_rows
+            if start_index < 0 or start_index > max_start_index:
+                return jsonify({
+                    'error': f'K线窗口起始索引无效，允许范围为 0 至 {max_start_index}',
+                    'max_start_index': max_start_index,
+                }), 400
+            data['start_date'] = df.iloc[start_index]['timestamps'].isoformat()
         
         # Perform prediction
         if MODEL_AVAILABLE and predictor is not None:
@@ -448,7 +773,7 @@ def predict():
                     
                     # Ensure sufficient data: lookback + pred_len
                     if len(time_range_df) < lookback + pred_len:
-                        return jsonify({'error': f'Insufficient data from start time {start_dt.strftime("%Y-%m-%d %H:%M")}, need at least {lookback + pred_len} data points, currently only {len(time_range_df)} available'}), 400
+                        return jsonify({'error': f'从 {start_dt.strftime("%Y-%m-%d %H:%M")} 开始的行情不足，需要 {lookback + pred_len} 根，当前只有 {len(time_range_df)} 根'}), 400
                     
                     # Use first lookback data points within selected window for prediction
                     x_df = time_range_df.iloc[:lookback][required_cols]
@@ -462,13 +787,13 @@ def predict():
                     end_timestamp = time_range_df['timestamps'].iloc[lookback+pred_len-1]
                     time_span = end_timestamp - start_timestamp
                     
-                    prediction_type = f"Kronos model prediction (within selected window: first {lookback} data points for prediction, last {pred_len} data points for comparison, time span: {time_span})"
+                    prediction_type = f"Kronos 模型预测（前 {lookback} 根作为历史输入，后 {pred_len} 根用于实际对比，跨度：{time_span}）"
                 else:
                     # Use latest data
                     x_df = df.iloc[:lookback][required_cols]
                     x_timestamp = df.iloc[:lookback]['timestamps']
                     y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps']
-                    prediction_type = "Kronos model prediction (latest data)"
+                    prediction_type = "Kronos 模型预测（最新行情）"
                 
                 # Ensure timestamps are Series format, not DatetimeIndex, to avoid .dt attribute error in Kronos model
                 if isinstance(x_timestamp, pd.DatetimeIndex):
@@ -487,9 +812,9 @@ def predict():
                 )
                 
             except Exception as e:
-                return jsonify({'error': f'Kronos model prediction failed: {str(e)}'}), 500
+                return jsonify({'error': f'Kronos 模型预测失败：{str(e)}'}), 500
         else:
-            return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
+            return jsonify({'error': 'Kronos 模型尚未加载，请先加载模型'}), 400
         
         # Prepare actual data for comparison (if exists)
         actual_data = []
@@ -593,7 +918,7 @@ def predict():
         # Save prediction results to file
         try:
             save_prediction_results(
-                file_path=file_path,
+                file_path=file_path or f'MT5:{data.get("symbol")}:{data.get("timeframe")}',
                 prediction_type=prediction_type,
                 prediction_results=prediction_results,
                 actual_data=actual_data,
@@ -604,7 +929,13 @@ def predict():
                     'temperature': temperature,
                     'top_p': top_p,
                     'sample_count': sample_count,
-                    'start_date': start_date if start_date else 'latest'
+                    'start_date': start_date if start_date else 'latest',
+                    'start_index': requested_start_index,
+                    'source': data.get('source', 'mt5'),
+                    'symbol': data.get('symbol'),
+                    'timeframe': data.get('timeframe'),
+                    'date_from': data.get('date_from'),
+                    'date_to': data.get('date_to')
                 }
             )
         except Exception as e:
@@ -617,11 +948,11 @@ def predict():
             'prediction_results': prediction_results,
             'actual_data': actual_data,
             'has_comparison': len(actual_data) > 0,
-            'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
+            'message': f'预测完成，已生成 {pred_len} 根预测K线' + (f'，并包含 {len(actual_data)} 根实际K线用于对比' if len(actual_data) > 0 else '')
         })
         
     except Exception as e:
-        return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
+        return jsonify({'error': f'预测失败：{str(e)}'}), 500
 
 @app.route('/api/load-model', methods=['POST'])
 def load_model():
@@ -630,14 +961,14 @@ def load_model():
     
     try:
         if not MODEL_AVAILABLE:
-            return jsonify({'error': 'Kronos model library not available'}), 400
+            return jsonify({'error': 'Kronos 模型库不可用'}), 400
         
         data = request.get_json()
         model_key = data.get('model_key', 'kronos-small')
         device = data.get('device', 'cpu')
         
         if model_key not in AVAILABLE_MODELS:
-            return jsonify({'error': f'Unsupported model: {model_key}'}), 400
+            return jsonify({'error': f'不支持的模型：{model_key}'}), 400
         
         model_config = AVAILABLE_MODELS[model_key]
         
@@ -650,7 +981,7 @@ def load_model():
         
         return jsonify({
             'success': True,
-            'message': f'Model loaded successfully: {model_config["name"]} ({model_config["params"]}) on {device}',
+            'message': f'模型加载成功：{model_config["name"]}（{model_config["params"]}），设备 {device}',
             'model_info': {
                 'name': model_config['name'],
                 'params': model_config['params'],
@@ -660,7 +991,7 @@ def load_model():
         })
         
     except Exception as e:
-        return jsonify({'error': f'Model loading failed: {str(e)}'}), 500
+        return jsonify({'error': f'模型加载失败：{str(e)}'}), 500
 
 @app.route('/api/available-models')
 def get_available_models():
