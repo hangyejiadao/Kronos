@@ -119,7 +119,11 @@ class CustomFinetuneConfig:
     def _load_all_configs(self):
 
         data_config = self.loader.get_data_config()
-        self.data_path = data_config.get('data_path')
+        # data_paths (list) takes precedence over data_path (single file);
+        # data_path may therefore be a str or a list of str.
+        self.data_path = data_config.get('data_paths', data_config.get('data_path'))
+        self.max_samples_per_series = data_config.get('max_samples_per_series')
+        self.max_val_samples_per_series = data_config.get('max_val_samples_per_series')
         self.lookback_window = data_config.get('lookback_window', 512)
         self.predict_window = data_config.get('predict_window', 48)
         self.max_context = data_config.get('max_context', 512)
@@ -193,6 +197,8 @@ class CustomFinetuneConfig:
 
         return {
             'data_path': self.data_path,
+            'max_samples_per_series': self.max_samples_per_series,
+            'max_val_samples_per_series': self.max_val_samples_per_series,
             'lookback_window': self.lookback_window,
             'predict_window': self.predict_window,
             'max_context': self.max_context,
@@ -219,6 +225,8 @@ class CustomFinetuneConfig:
 
         return {
             'data_path': self.data_path,
+            'max_samples_per_series': self.max_samples_per_series,
+            'max_val_samples_per_series': self.max_val_samples_per_series,
             'lookback_window': self.lookback_window,
             'predict_window': self.predict_window,
             'max_context': self.max_context,

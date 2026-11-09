@@ -23,10 +23,27 @@ from config_loader import CustomFinetuneConfig
 
 
 class CustomKlineDataset(Dataset):
-    
-    def __init__(self, data_path, data_type='train', lookback_window=90, predict_window=10, 
-                 clip=5.0, seed=100, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
-        self.data_path = data_path
+    """K-line dataset supporting one CSV (legacy) or a list of CSVs.
+
+    Multi-series mode (one CSV per timeframe): each CSV is treated as an
+    independent series. Train/val/test splits are applied per series in
+    time order, and sliding windows are sampled only within a single
+    series, so windows never cross timeframes. A series shorter than
+    lookback+predict+1 contributes zero samples (e.g. MN1 with 155 bars).
+    `max_samples_per_series` caps the number of windows taken from each
+    series (stride-sampled across the whole series, so the capped subset
+    still spans the full time range); it both balances the timeframes and
+    bounds the training set size.
+    """
+
+    def __init__(self, data_path, data_type='train', lookback_window=90, predict_window=10,
+                 clip=5.0, seed=100, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,
+                 max_samples_per_series=None):
+        # data_path: a single CSV path (legacy) or a list/tuple of CSV paths.
+        if isinstance(data_path, (list, tuple)):
+            self.data_paths = list(data_path)
+        else:
+            self.data_paths = [data_path]
         self.data_type = data_type
         self.lookback_window = lookback_window
         self.predict_window = predict_window
@@ -36,103 +53,117 @@ class CustomKlineDataset(Dataset):
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
-        
+        self.max_samples_per_series = max_samples_per_series
+
         self.feature_list = ['open', 'high', 'low', 'close', 'volume', 'amount']
         self.time_feature_list = ['minute', 'hour', 'weekday', 'day', 'month']
-        
+
         self.py_rng = random.Random(seed)
-        
+
         self._load_and_preprocess_data()
         self._split_data_by_time()
-        
-        self.n_samples = len(self.data) - self.window + 1
-            
-        print(f"[{data_type.upper()}] Data length: {len(self.data)}, Available samples: {self.n_samples}")
-    
+        self._build_window_index()
+
+        print(f"[{data_type.upper()}] Total available samples: {self.n_samples}")
+        for s, starts in zip(self.series, self.series_starts):
+            print(f"[{data_type.upper()}]   {s['name']}: {len(s['data'])} bars -> {len(starts)} samples")
+
     def _load_and_preprocess_data(self):
-        df = pd.read_csv(self.data_path)
-        
-        df['timestamps'] = pd.to_datetime(df['timestamps'])
-        df = df.sort_values('timestamps').reset_index(drop=True)
-        
-        self.timestamps = df['timestamps'].copy()
-        
-        df['minute'] = df['timestamps'].dt.minute
-        df['hour'] = df['timestamps'].dt.hour
-        df['weekday'] = df['timestamps'].dt.weekday
-        df['day'] = df['timestamps'].dt.day
-        df['month'] = df['timestamps'].dt.month
-        
-        self.data = df[self.feature_list + self.time_feature_list].copy()
-        
-        if self.data.isnull().any().any():
-            print("Warning: Missing values found in data, performing forward fill")
-            self.data = self.data.fillna(method='ffill')
-        
-        print(f"Original data time range: {self.timestamps.min()} to {self.timestamps.max()}")
-        print(f"Original data total length: {len(df)} records")
-    
+        self.series = []
+        for path in self.data_paths:
+            df = pd.read_csv(path)
+            df['timestamps'] = pd.to_datetime(df['timestamps'])
+            df = df.sort_values('timestamps').reset_index(drop=True)
+            timestamps = df['timestamps'].copy()
+            df['minute'] = df['timestamps'].dt.minute
+            df['hour'] = df['timestamps'].dt.hour
+            df['weekday'] = df['timestamps'].dt.weekday
+            df['day'] = df['timestamps'].dt.day
+            df['month'] = df['timestamps'].dt.month
+            data = df[self.feature_list + self.time_feature_list].copy()
+            if data.isnull().any().any():
+                print(f"Warning: Missing values found in {path}, performing forward fill")
+                data = data.fillna(method='ffill')
+            name = os.path.splitext(os.path.basename(path))[0]
+            self.series.append({'name': name, 'path': path, 'data': data, 'timestamps': timestamps})
+            print(f"Loaded {name}: {len(df)} records, {timestamps.min()} to {timestamps.max()}")
+
     def _split_data_by_time(self):
-        total_length = len(self.data)
-        
-        train_end = int(total_length * self.train_ratio)
-        val_end = int(total_length * (self.train_ratio + self.val_ratio))
-        
-        if self.data_type == 'train':
-            self.data = self.data.iloc[:train_end].copy()
-            self.timestamps = self.timestamps.iloc[:train_end].copy()
-            print(f"[{self.data_type.upper()}] Training set: first {train_end} time points ({self.train_ratio})")
-            print(f"[{self.data_type.upper()}] Training set time range: {self.timestamps.min()} to {self.timestamps.max()}")
-        elif self.data_type == 'val':
-            self.data = self.data.iloc[train_end:val_end].copy()
-            self.timestamps = self.timestamps.iloc[train_end:val_end].copy()
-            print(f"[{self.data_type.upper()}] Validation set: time points {train_end+1} to {val_end} ({self.val_ratio})")
-            print(f"[{self.data_type.upper()}] Validation set time range: {self.timestamps.min()} to {self.timestamps.max()}")
-        elif self.data_type == 'test':
-            self.data = self.data.iloc[val_end:].copy()
-            self.timestamps = self.timestamps.iloc[val_end:].copy()
-            print(f"[{self.data_type.upper()}] Test set: after time point {val_end+1}")
-            print(f"[{self.data_type.upper()}] Test set time range: {self.timestamps.min()} to {self.timestamps.max()}")
-        
-        print(f"[{self.data_type.upper()}] Data length after split: {len(self.data)} records")
-    
+        for s in self.series:
+            total_length = len(s['data'])
+            train_end = int(total_length * self.train_ratio)
+            val_end = int(total_length * (self.train_ratio + self.val_ratio))
+            if self.data_type == 'train':
+                s['data'] = s['data'].iloc[:train_end].copy()
+                s['timestamps'] = s['timestamps'].iloc[:train_end].copy()
+            elif self.data_type == 'val':
+                s['data'] = s['data'].iloc[train_end:val_end].copy()
+                s['timestamps'] = s['timestamps'].iloc[train_end:val_end].copy()
+            elif self.data_type == 'test':
+                s['data'] = s['data'].iloc[val_end:].copy()
+                s['timestamps'] = s['timestamps'].iloc[val_end:].copy()
+            if len(s['data']):
+                print(f"[{self.data_type.upper()}] {s['name']}: {len(s['data'])} records after split "
+                      f"({s['timestamps'].min()} to {s['timestamps'].max()})")
+            else:
+                print(f"[{self.data_type.upper()}] {s['name']}: 0 records after split")
+
+    def _build_window_index(self):
+        # Per-series allowed window start positions. When capped, stride-sample
+        # across the whole series so the subset still covers the full range.
+        self.series_starts = []
+        self.series_offsets = []
+        total = 0
+        for s in self.series:
+            n_win = max(0, len(s['data']) - self.window + 1)
+            if self.max_samples_per_series is not None and n_win > self.max_samples_per_series:
+                stride = n_win / self.max_samples_per_series
+                starts = (np.arange(self.max_samples_per_series, dtype=np.float64) * stride).astype(np.int64)
+            else:
+                starts = np.arange(n_win, dtype=np.int64)
+            self.series_starts.append(starts)
+            self.series_offsets.append(total)
+            total += len(starts)
+        self.n_samples = total
+        self.series_offsets_arr = np.array(self.series_offsets, dtype=np.int64)
+
     def set_epoch_seed(self, epoch):
         epoch_seed = self.seed + epoch
         self.py_rng.seed(epoch_seed)
         self.current_epoch = epoch
-    
+
     def __len__(self):
         return self.n_samples
-    
+
     def __getitem__(self, idx):
-        max_start = len(self.data) - self.window
-        if max_start <= 0:
+        if self.n_samples == 0:
             raise ValueError("Data length insufficient to create samples")
-        
+
         if self.data_type == 'train':
             epoch = getattr(self, 'current_epoch', 0)
-            start_idx = (idx * 9973 + (epoch + 1) * 104729) % (max_start + 1)
+            idx = (idx * 9973 + (epoch + 1) * 104729) % self.n_samples
         else:
-            start_idx = idx % (max_start + 1)
-        
+            idx = idx % self.n_samples
+
+        series_idx = int(np.searchsorted(self.series_offsets_arr, idx, side='right')) - 1
+        local_idx = idx - self.series_offsets[series_idx]
+        start_idx = int(self.series_starts[series_idx][local_idx])
+        data = self.series[series_idx]['data']
+
         end_idx = start_idx + self.window
-        
-        window_data = self.data.iloc[start_idx:end_idx]
-        
+        window_data = data.iloc[start_idx:end_idx]
+
         x = window_data[self.feature_list].values.astype(np.float32)
         x_stamp = window_data[self.time_feature_list].values.astype(np.float32)
-        
+
         x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
         x = (x - x_mean) / (x_std + 1e-5)
         x = np.clip(x, -self.clip, self.clip)
-        
+
         x_tensor = torch.from_numpy(x)
         x_stamp_tensor = torch.from_numpy(x_stamp)
-        
+
         return x_tensor, x_stamp_tensor
-
-
-
 
 def setup_logging(exp_name: str, log_dir: str, rank: int = 0) -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
@@ -191,7 +222,8 @@ def create_dataloaders(config):
         seed=config.seed,
         train_ratio=config.train_ratio,
         val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio
+        test_ratio=config.test_ratio,
+        max_samples_per_series=getattr(config, 'max_samples_per_series', None)
     )
     
     val_dataset = CustomKlineDataset(
@@ -203,7 +235,8 @@ def create_dataloaders(config):
         seed=config.seed + 1,
         train_ratio=config.train_ratio,
         val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio
+        test_ratio=config.test_ratio,
+        max_samples_per_series=getattr(config, 'max_val_samples_per_series', None)
     )
     
     use_ddp = dist.is_available() and dist.is_initialized()

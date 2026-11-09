@@ -1,0 +1,80 @@
+# Gold XAUUSD multi-timeframe finetune: 9 timeframes, ONE model (approach B, user confirmed 2026-11-07).
+# CustomKlineDataset (patched, see patch_multitimeframe.py) treats each CSV as an
+# independent series: splits are per-series in time order and windows never cross
+# timeframes. MN1 (155 bars) contributes 0 windows (shorter than lookback+predict+1);
+# W1 (669 bars) contributes only a handful - both are expected.
+# max_samples_per_series caps windows per series (stride-sampled across the whole
+# series, so the capped subset still spans 2014-2026). It balances the timeframes
+# (otherwise M1 alone would be ~75% of all windows) and bounds the training-set
+# size for the 8GB GPU. Epoch counts below are starting values; tune them after
+# the smoke test measures seconds-per-batch on this GPU.
+# NOTE: finetune_base_model.train_model ignores accumulation_steps, so the
+# effective predictor batch is batch_size (8), not batch_size x accum.
+# num_workers 0: on Windows, workers are spawned (not forked) and the ~300MB
+# M1 dataset would be pickled to each worker; in-process loading is fast enough
+# here because each batch is only 8 windows.
+
+data:
+  data_paths:
+    - "D:/Kronos/finetune_csv/data/XAUUSD_M1.csv"
+    - "D:/Kronos/finetune_csv/data/XAUUSD_M5.csv"
+    - "D:/Kronos/finetune_csv/data/XAUUSD_M15.csv"
+    - "D:/Kronos/finetune_csv/data/XAUUSD_M30.csv"
+    - "D:/Kronos/finetune_csv/data/XAUUSD_H1.csv"
+    - "D:/Kronos/finetune_csv/data/XAUUSD_H4.csv"
+    - "D:/Kronos/finetune_csv/data/XAUUSD_D1.csv"
+    - "D:/Kronos/finetune_csv/data/XAUUSD_W1.csv"
+    - "D:/Kronos/finetune_csv/data/XAUUSD_MN1.csv"
+  lookback_window: 512
+  predict_window: 48
+  max_context: 512
+  clip: 5.0
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+  max_samples_per_series: 100000
+  max_val_samples_per_series: 20000
+
+training:
+  tokenizer_epochs: 3
+  basemodel_epochs: 2
+  batch_size: 8
+  log_interval: 50
+  num_workers: 0
+  seed: 42
+
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.000001
+
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+
+  accumulation_steps: 4
+
+model_paths:
+  pretrained_tokenizer: "D:/Kronos/pretrained/Kronos-Tokenizer-base"
+  pretrained_predictor: "D:/Kronos/pretrained/Kronos-base"
+
+  exp_name: "XAUUSD_all_timeframes_base"
+  base_path: "D:/Kronos/finetune_csv/finetuned/"
+
+  base_save_path: ""
+  finetuned_tokenizer: ""
+
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+experiment:
+  name: "kronos_gold_multitimeframe"
+  description: "Gold XAUUSD multi-timeframe finetune (M1-MN1, one model)"
+  use_comet: false
+
+  train_tokenizer: true
+  train_basemodel: true
+
+  skip_existing: false
+
+device:
+  use_cuda: true
+  device_id: 0

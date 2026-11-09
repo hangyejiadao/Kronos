@@ -65,7 +65,10 @@ def ensure_mt5_connection():
         return False, 'MetaTrader5 Python package is not installed'
     if mt5.terminal_info() is not None:
         return True, None
-    if not mt5.initialize():
+    # The terminal is a portable install at D:\mt5 (no registry entry),
+    # so the MT5 package cannot find it on its own (error -10003).
+    # Pass the exe path explicitly; fall back to auto-detect.
+    if not mt5.initialize(path=r'D:\mt5\terminal64.exe') and not mt5.initialize():
         code, message = mt5.last_error()
         return False, f'MT5 initialization failed ({code}): {message}'
     return True, None
@@ -153,15 +156,15 @@ AVAILABLE_MODELS = {
     'kronos-small': {
         'name': 'Kronos-small',
         'model_id': 'NeoQuasar/Kronos-small',
-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
+        'tokenizer_id': r'D:/Kronos/pretrained/Kronos-Tokenizer-base',
         'context_length': 512,
         'params': '24.7M',
         'description': '小型模型，兼顾效果与速度'
     },
     'kronos-base': {
         'name': 'Kronos-base',
-        'model_id': 'NeoQuasar/Kronos-base',
-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
+        'model_id': r'D:/Kronos/pretrained/Kronos-base',
+        'tokenizer_id': r'D:/Kronos/pretrained/Kronos-Tokenizer-base',
         'context_length': 512,
         'params': '102.3M',
         'description': '基础模型，提供更高预测质量'

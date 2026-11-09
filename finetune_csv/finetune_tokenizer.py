@@ -103,7 +103,8 @@ def create_dataloaders(config):
         seed=config.seed,
         train_ratio=config.train_ratio,
         val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio
+        test_ratio=config.test_ratio,
+        max_samples_per_series=getattr(config, 'max_samples_per_series', None)
     )
     
     val_dataset = CustomKlineDataset(
@@ -115,7 +116,8 @@ def create_dataloaders(config):
         seed=config.seed + 1,
         train_ratio=config.train_ratio,
         val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio
+        test_ratio=config.test_ratio,
+        max_samples_per_series=getattr(config, 'max_val_samples_per_series', None)
     )
     
     use_ddp = dist.is_available() and dist.is_initialized()

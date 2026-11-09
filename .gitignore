@@ -74,3 +74,12 @@ venv.bak/
 temp/
 tmp/
 .python-version
+ 
+# Gold finetune: local data, models, venvs (do not commit) 
+*.csv 
+*.orig 
+*.err 
+.venv-*/ 
+pretrained/ 
+finetune_csv/finetuned/ 
+finetune_csv/data/ 
