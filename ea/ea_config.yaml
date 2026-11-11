@@ -1,0 +1,44 @@
+# EA + 回测共用配置（2026-11-10 草稿；数值均为起点，待回测扫参）
+# 品种/周期：XAUUSDm / H1（推荐，见 EA_DESIGN.md）
+symbol: XAUUSDm
+timeframe: H1
+
+# 信号：lookback 400 / pred_len 12 与实盘一致（2026-11-11 WS 版：
+# ws_signal_bridge.py 调 /api/ea_signal 就是 lookback 400、pred_len 12、
+# horizon 12；回测信号必须与实盘同参，否则回测结果指导不了实盘）
+lookback: 400
+pred_len: 12
+horizon: 12            # 用预测第 12 根收盘价判断方向
+temperature: 1.0
+top_p: 0.9
+sample_count: 1
+
+# 信号阈值：预测 12 根后的预期涨跌幅（小数，如 0.001 = 0.10%）
+# 起点 0.10%，扫参范围建议 0.0005 / 0.001 / 0.0015 / 0.002 / 0.003
+threshold_pct: 0.001
+
+# 止损/止盈：ATR(14) 的倍数。atr_mode 必须与实盘一致：
+# proxy = 14 根 high-low 均值（/api/ea_signal 发给 EA 的 atr，EA 用它算
+# sl_dist/tp_dist）；true = 经典真实波幅 ATR（仅作对照）
+atr_period: 14
+atr_mode: proxy
+sl_atr_mult: 1.5
+tp_atr_mult: 3.0
+
+# 仓位：每笔固定风险占权益比例；XAUUSD 1 手 = 100 盎司
+risk_per_trade_pct: 0.01
+max_lot: 1.0
+min_lot: 0.01
+lot_step: 0.01
+
+# 成本（美元/盎司）：spread_usd 只是占位符，必须以主机 MT5 symbol_info 实测为准
+spread_usd: 0.35
+slippage_usd: 0.10
+
+# 回测：只用验证集（每周期后 10%，与 evaluate_gold_vs_base.py 同一切分）
+val_ratio: 0.1
+# 信号生成步长（根）：回测专用折中，实盘每根都预测；H1 验证集步长 6 约 970 次预测
+signal_step_bars: 6
+
+# 回测资金
+initial_equity_usd: 10000.0
