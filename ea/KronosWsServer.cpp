@@ -1,28 +1,28 @@
-// KronosWsServer.cpp  --  WebSocket server DLL for the MQL5 EA.
+// KronosWsServer.cpp —— 供 MQL5 EA 使用的 WebSocket 服务端 DLL。
 //
-// Why C++ (not C#): MQL5 #import can only load a NATIVE DLL directly.
-// A C# assembly cannot be loaded by MT5 without an extra C++/CLI
-// wrapper, so the server is written in C++ as a plain Win32 DLL.
-// No third-party libraries: Winsock2 for sockets, Windows CryptoAPI
-// (Crypt32) for the SHA-1 in the WebSocket handshake, std::thread
-// for the accept / client threads. Single file, no dependencies.
+// 为什么用 C++（而不用 C#）：MQL5 的 #import 只能直接加载原生 DLL。
+// C# 程序集不额外包一层 C++/CLI 的话，MT5 加载不了，
+// 所以服务端用 C++ 写成普通的 Win32 DLL。
+// 不依赖第三方库：用 Winsock2 做 socket，用 Windows CryptoAPI
+//（Crypt32）算 WebSocket 握手里的 SHA-1，用 std::thread 跑
+// 接受连接/客户端线程。单文件，无依赖。
 //
-// Build on the Windows host (pick the one that exists there):
+// 在 Windows 主机上编译（按主机上已有的工具选一种）：
 //   MSVC (VS Developer Command Prompt):
 //     cl /LD /EHsc KronosWsServer.cpp /link ws2_32.lib Crypt32.lib
 //   MinGW-w64:
 //     g++ -shared -o KronosWsServer.dll KronosWsServer.cpp -lws2_32 -lcrypt32 -static-libgcc -static-libstdc++
 //
-// Install: copy KronosWsServer.dll to the MT5 data folder
+// 安装：把 KronosWsServer.dll 复制到 MT5 数据文件夹
 //   MQL5\Libraries\
-// and tick "Allow DLL imports" in the EA's settings / MT5 options.
-// The server listens ONLY on 127.0.0.1 (localhost), never on the LAN.
+// 并在 EA 设置 / MT5 选项里勾选“允许 DLL 导入”。
+// 服务端只监听 127.0.0.1（本机），绝不监听局域网。
 //
-// Protocol (text frames, one JSON object per frame):
+// 协议（文本帧，每帧一个 JSON 对象）：
 //   Python -> EA : {"signal":"LONG","change_pct":0.42,...,"bar_time":"..."} (from /api/ea_signal)
 //   EA -> Python : {"type":"ea_status",...} / {"type":"ea_ack","bar_time":"..."} (optional)
-// The DLL just moves strings: it queues every text frame it receives,
-// the EA drains the queue with WsGetSignal(). It does NOT parse JSON.
+// DLL 只负责传字符串：收到的每个文本帧都进队列，
+// EA 用 WsGetSignal() 取出队列里的消息。DLL 不解析 JSON。
 
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -45,14 +45,14 @@
 
 namespace {
 
-// ---- shared state -------------------------------------------------------
+// ---- 共享状态 ------------------------------------------------------------
 std::atomic<bool>     g_running{false};
 SOCKET                g_listenSocket = INVALID_SOCKET;
 int                   g_port = 8081;
 std::thread           g_acceptThread;
 std::vector<SOCKET>   g_clients;
 std::mutex            g_clientsMutex;
-std::queue<std::string> g_messages;   // text frames received, in order
+std::queue<std::string> g_messages;   // 按接收顺序排列的文本帧
 std::mutex            g_messagesMutex;
 
 void RemoveClient(SOCKET s)
@@ -67,7 +67,7 @@ void AddClient(SOCKET s)
     g_clients.push_back(s);
 }
 
-// Receive exactly `len` bytes (or false on disconnect / error).
+// 恰好接收 `len` 个字节（断开连接或出错时返回 false）。
 bool RecvExact(SOCKET s, char* buf, int len)
 {
     int got = 0;
@@ -80,7 +80,7 @@ bool RecvExact(SOCKET s, char* buf, int len)
     return true;
 }
 
-// Send the whole buffer (or false on error).
+// 发送整个缓冲区（出错时返回 false）。
 bool SendAll(SOCKET s, const char* buf, int len)
 {
     int sent = 0;
@@ -93,8 +93,8 @@ bool SendAll(SOCKET s, const char* buf, int len)
     return true;
 }
 
-// WebSocket accept key: base64( SHA1(key + GUID) ), via CryptoAPI so
-// we do not hand-roll SHA-1 / base64.
+// WebSocket 握手应答 key：base64(SHA1(key + GUID)），用 CryptoAPI 计算，
+// 这样就不用自己手写 SHA-1 / base64。
 bool ComputeAcceptKey(const std::string& clientKey, std::string& acceptKey)
 {
     static const char* kGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -117,8 +117,8 @@ bool ComputeAcceptKey(const std::string& clientKey, std::string& acceptKey)
                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
                              b64, &b64Len))
     {
-        // b64Len counts the terminating NUL; assign as a C string so
-        // the accept key never carries an embedded NUL into the 101.
+        // b64Len 包含结尾的 NUL；按 C 字符串赋值，
+        // 这样应答 key 就不会把内嵌的 NUL 带进 101 响应里。
         acceptKey = b64;
         ok = true;
     }
@@ -135,8 +135,8 @@ std::string Trim(const std::string& s)
     return s.substr(a, b - a + 1);
 }
 
-// Minimal HTTP handshake: read headers until blank line, find
-// Sec-WebSocket-Key, answer 101 Switching Protocols.
+// 最简 HTTP 握手：一直读请求头直到空行，找到
+// Sec-WebSocket-Key，回复 101 Switching Protocols。
 bool DoHandshake(SOCKET s)
 {
     std::string headers;
@@ -167,11 +167,11 @@ bool DoHandshake(SOCKET s)
     return SendAll(s, resp.data(), (int)resp.size());
 }
 
-// Send one unmasked text frame (server -> client must NOT mask).
+// 发送一个不掩码的文本帧（服务端发给客户端时必须不掩码）。
 bool SendTextFrame(SOCKET s, const std::string& msg)
 {
     std::string frame;
-    frame.push_back(char(0x81));  // FIN + text opcode
+    frame.push_back(char(0x81));  // FIN + 文本帧操作码
     size_t len = msg.size();
     if (len < 126)
     {
@@ -193,7 +193,7 @@ bool SendTextFrame(SOCKET s, const std::string& msg)
     return SendAll(s, frame.data(), (int)frame.size());
 }
 
-// One client connection: handshake, then read frames until close/error.
+// 处理一个客户端连接：先握手，然后一直读帧，直到关闭或出错。
 void ClientThread(SOCKET s)
 {
     if (!DoHandshake(s))
@@ -203,7 +203,7 @@ void ClientThread(SOCKET s)
     }
     AddClient(s);
 
-    std::string fragmented;  // accumulation for fragmented (FIN=0) messages
+    std::string fragmented;  // 分片消息（FIN=0）的累积缓冲区
     while (g_running)
     {
         unsigned char hdr[2];
@@ -228,7 +228,7 @@ void ClientThread(SOCKET s)
         unsigned char mask[4] = {0, 0, 0, 0};
         if (masked && !RecvExact(s, (char*)mask, 4)) break;
 
-        if (len > (uint64_t)16 * 1024 * 1024) break;  // sanity cap: 16 MB
+        if (len > (uint64_t)16 * 1024 * 1024) break;  // 合理性上限：16 MB
         std::string payload;
         payload.resize((size_t)len);
         if (len > 0 && !RecvExact(s, &payload[0], (int)len)) break;
@@ -236,8 +236,8 @@ void ClientThread(SOCKET s)
             for (size_t i = 0; i < payload.size(); ++i)
                 payload[i] ^= (char)mask[i % 4];
 
-        if (opcode == 0x8) break;                    // close
-        if (opcode == 0x9)                           // ping -> pong
+        if (opcode == 0x8) break;                    // 关闭帧
+        if (opcode == 0x9)                           // ping -> 回 pong
         {
             std::string pong;
             pong.push_back(char(0x8A));
@@ -246,8 +246,8 @@ void ClientThread(SOCKET s)
             if (!SendAll(s, pong.data(), (int)pong.size())) break;
             continue;
         }
-        if (opcode == 0xA) continue;                 // pong: ignore
-        if (opcode != 0x1 && opcode != 0x0) continue; // only text / continuation
+        if (opcode == 0xA) continue;                 // pong：忽略
+        if (opcode != 0x1 && opcode != 0x0) continue; // 只处理文本帧 / 续帧
 
         fragmented += payload;
         if (!fin) continue;
@@ -276,12 +276,12 @@ void AcceptThread()
     }
 }
 
-}  // namespace
+}  // 命名空间结束
 
-// ---- exported API (MQL5 #import, __stdcall) ------------------------------
+// ---- 对外导出的 API（MQL5 #import 调用，__stdcall）-------------------------
 extern "C" {
 
-// Start the server on 127.0.0.1:port. Returns 1 ok, 0 already running, -1 error.
+// 在 127.0.0.1:port 上启动服务端。返回 1 表示成功，0 表示已在运行，-1 表示出错。
 __declspec(dllexport) int __stdcall WsStart(int port)
 {
     if (g_running) return 0;
@@ -295,7 +295,7 @@ __declspec(dllexport) int __stdcall WsStart(int port)
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1 only
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 仅限 127.0.0.1
     addr.sin_port = htons((u_short)port);
     if (bind(ls, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR ||
         listen(ls, 8) == SOCKET_ERROR)
@@ -311,7 +311,7 @@ __declspec(dllexport) int __stdcall WsStart(int port)
     return 1;
 }
 
-// Stop the server. Safe to call twice.
+// 停止服务端。重复调用是安全的。
 __declspec(dllexport) void __stdcall WsStop()
 {
     if (!g_running) return;
@@ -341,17 +341,17 @@ __declspec(dllexport) int __stdcall WsClientCount()
     return (int)g_clients.size();
 }
 
-// 1 if an unread message is queued, else 0.
+// 队列里有未读消息时返回 1，否则返回 0。
 __declspec(dllexport) int __stdcall WsHasSignal()
 {
     std::lock_guard<std::mutex> lock(g_messagesMutex);
     return g_messages.empty() ? 0 : 1;
 }
 
-// Pop the oldest queued text frame into `buffer` (UTF-8, NOT
-// null-terminated by us; the return value is the byte count).
-// Returns 0 = queue empty, -1 = buffer too small (message stays
-// queued, call again with a bigger buffer), -2 = server not running.
+// 把队列里最旧的文本帧取出来放进 `buffer`（UTF-8，我们不会在末尾补
+// 空字符；返回值是字节数）。
+// 返回 0 = 队列为空，-1 = 缓冲区太小（消息留在队列里，换个更大的缓冲区再取），
+// -2 = 服务端未运行。
 __declspec(dllexport) int __stdcall WsGetSignal(char* buffer, int bufferSize)
 {
     if (!g_running) return -2;
@@ -365,8 +365,8 @@ __declspec(dllexport) int __stdcall WsGetSignal(char* buffer, int bufferSize)
     return n;
 }
 
-// Broadcast a text frame to every connected client.
-// Returns the number of clients it was sent to.
+// 向所有已连接的客户端广播一个文本帧。
+// 返回成功发送到的客户端数量。
 __declspec(dllexport) int __stdcall WsSendText(const char* msg, int len)
 {
     if (!g_running || msg == nullptr || len <= 0) return 0;
@@ -380,9 +380,9 @@ __declspec(dllexport) int __stdcall WsSendText(const char* msg, int len)
 
 }  // extern "C"
 
-// NOTE: do NOT call WsStop() from DllMain -- joining a thread while
-// the loader lock is held can deadlock MT5 on unload. The EA's
-// OnDeinit() calls WsStop() explicitly, which is the clean shutdown.
+// 注意：不要在 DllMain 里调用 WsStop()——在持有加载器锁的情况下 join 线程
+// 会导致 MT5 卸载 DLL 时死锁。EA 的
+// OnDeinit() 会显式调用 WsStop()，那才是干净的关闭方式。
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID)
 {
     return TRUE;

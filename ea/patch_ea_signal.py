@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Add /api/ea_signal to D:\\Kronos\\webui\\app.py  (run ON the Windows host).
+给 D:\\Kronos\\webui\\app.py 加上 /api/ea_signal（在 Windows 主机上运行）。
 
-What it adds:
-  * load_mt5_recent(symbol, timeframe, count) - pulls the last N bars
-    with mt5.copy_rates_from_pos, so the EA never has to send OHLC
-    or compute date ranges. The EA only sends symbol/timeframe.
-  * POST /api/ea_signal - runs the already-loaded kronos-gold predictor
-    on the last 400 bars, PARSES the forecast bars in Python and
-    returns a flat signal JSON the MQL5 EA can parse with StringFind:
+本补丁加了这些内容：
+  * load_mt5_recent(symbol, timeframe, count)——用 mt5.copy_rates_from_pos
+    取最近 N 根 K 线，这样 EA 不用发送 OHLC 数据，也不用算日期范围，
+    只发品种和周期就行。
+  * POST /api/ea_signal——用已加载的 kronos-gold 预测器对最近 400 根 K 线
+    做预测，在 Python 里解析预测 K 线，返回一个扁平的信号 JSON，
+    MQL5 EA 用 StringFind 就能解析：
         {"signal":"LONG"|"SHORT"|"FLAT", "change_pct":0.42,
          "last_close":..., "pred_close":..., "up_ratio":0.83,
          "atr":..., "sl_dist":..., "tp_dist":...,
          "model":"kronos-gold", "timeframe":"H1", "horizon":12, ...}
-    signal rule: change_pct at `horizon` >= +threshold_pct -> LONG,
-                 <= -threshold_pct -> SHORT, else FLAT.
-    sl_dist = ATR * sl_atr_mult, tp_dist = ATR * tp_atr_mult.
+    信号规则：第 `horizon` 根的 change_pct >= +threshold_pct -> LONG，
+               <= -threshold_pct -> SHORT，否则 FLAT。
+    sl_dist = ATR × sl_atr_mult，tp_dist = ATR × tp_atr_mult。
 
-Usage (on the host, in PowerShell):
+用法（在主机上，用 PowerShell）：
     cd D:\\Kronos\\ea
     D:\\Kronos\\.venv-gold\\Scripts\\python.exe patch_ea_signal.py
-    # then restart the KronosWebUI scheduled task so Flask reloads app.py
+    # 然后重启 KronosWebUI 计划任务，让 Flask 重新加载 app.py
 
-IMPORTANT: do NOT copy this file into D:\\Kronos\\webui\\ - Flask's
-reloader watches that folder and restarts the server on any new .py.
-Keep it in D:\\Kronos\\ea\\.
+重要：不要把本文件复制到 D:\\Kronos\\webui\\——Flask 的重载器会监听
+那个文件夹，新增 .py 文件就会重启服务。放在 D:\\Kronos\\ea\\。
 """
 
 import datetime
@@ -37,8 +36,7 @@ APP = pathlib.Path(r"D:\Kronos\webui\app.py")
 
 EA_CODE = r'''
 def load_mt5_recent(symbol, timeframe, count=400):
-    # Fetch the last `count` bars straight from the MT5 terminal on
-    # this host. No date range needed - the EA just names the symbol.
+    # 直接从本机 MT5 终端取最近 `count` 根 K 线。不需要日期范围，EA 只报品种名就行。
     connected, error = ensure_mt5_connection()
     if not connected:
         return None, error
@@ -63,8 +61,8 @@ def load_mt5_recent(symbol, timeframe, count=400):
 
 @app.route('/api/ea_signal', methods=['POST'])
 def ea_signal():
-    # EA endpoint: Python runs the model and parses the forecast into
-    # one flat signal, so the MQL5 EA only has to read a few fields.
+    # EA 专用接口：Python 运行模型并把预测结果解析成一个扁平信号，
+    # MQL5 EA 只需要读其中几个字段。
     try:
         data = request.get_json(force=True, silent=True) or {}
         symbol = data.get('symbol', 'XAUUSDm')
@@ -112,13 +110,13 @@ def ea_signal():
     except Exception as exc:
         return jsonify({'signal': 'FLAT', 'error': f'Model prediction failed: {exc}'}), 500
 
-    # --- Python parses the model output into a trading signal ---
+    # --- Python 把模型输出解析成交易信号 ---
     last_close = float(x_df['close'].iloc[-1])
     pred_closes = [float(c) for c in pred_df['close'].tolist()]
     pred_close_h = pred_closes[horizon - 1]
     change_pct = (pred_close_h - last_close) / last_close * 100.0 if last_close else 0.0
     up_ratio = sum(1 for c in pred_closes if c > last_close) / max(1, len(pred_closes))
-    # ATR proxy: mean true-range-ish (high-low) over the last 14 bars.
+    # ATR 近似值：最近 14 根 K 线的（最高价-最低价）均值，近似真实波幅。
     hl = (df['high'] - df['low']).tail(14)
     atr = float(hl.mean()) if len(hl) else 0.0
     sl_dist = atr * sl_mult

@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-# Generate EA signals on the Windows host ONLY (GPU + data + models live there).
-# Mirrors evaluate_gold_vs_base.py exactly: same per-series time split
-# (validation = last 10% of the CSV), same lookback/pred_len, same sampling
-# settings as the 8077 UI (T=1.0, top_p=0.9, sample_count=1).
+# 只在 Windows 主机上生成 EA 信号（GPU、数据和模型都在主机上）。
+# 与 evaluate_gold_vs_base.py 完全一致：同样的按周期时间切分
+#（验证集 = CSV 的后 10%），同样的 lookback/pred_len，同样的采样设置，
+# 与 8077 界面一致（T=1.0，top_p=0.9，sample_count=1）。
 #
-# Difference vs the evaluator: instead of 50 stride-sampled windows per TF for
-# accuracy metrics, this walks the validation slice every `signal_step_bars`
-# (default 6) and records the raw predicted 12-bar move for EVERY sampled
-# window, so backtest.py can sweep thresholds without re-running the model.
+# 与评估脚本的区别：评估脚本是每个周期取 50 个步长采样的窗口算准确率，
+# 本脚本是每隔 `signal_step_bars` 根 K 线走一遍验证集，
+# 记录每个采样窗口原始的 12 根预测涨跌幅，
+# 这样 backtest.py 扫阈值时就不用重新跑模型。
 #
-# Parameters match the LIVE signal path exactly (2026-11-11, WebSocket EA):
-# lookback 400 and pred_len 12 are what ws_signal_bridge.py asks 8077
-# /api/ea_signal for, so backtest signals are the same predictions the EA
-# would have traded on. (The evaluator used 512/48; that costs ~3x the GPU
-# time for the same 12th-bar signal.)
+# 参数与实盘信号链路完全一致（2026-11-11，WebSocket 版 EA）：
+# lookback 400、pred_len 12 就是 ws_signal_bridge.py 向 8077 的
+# /api/ea_signal 请求的参数，所以回测信号就是 EA 本来会用来交易的那些预测。
+#（评估脚本用的是 512/48，跑同样第 12 根信号要多花约 3 倍 GPU 时间。）
 #
-# Cost: H1 val slice ~5,830 bars / step 6 -> ~970 predicts x ~2 s ~= 35 min.
-# Stop the KronosWebUI task first (8077 holds the gold model on the same 8GB
-# GPU); use the Task Scheduler pattern for long runs (SSH children die when
-# the session drops). Run from D:\\Kronos so `from model import ...` resolves.
+#
+# 开销：H1 验证集约 5,830 根 K 线 / 步长 6 -> 约 970 次预测 × 约 2 秒 ≈ 35 分钟。
+# 先停掉 KronosWebUI 任务（8077 在同一块 8GB 显卡上占着黄金模型）；
+# 长时间运行用任务计划挂着（SSH 会话断开时，子进程会被杀掉）。在 D:\Kronos 下运行，
+# 这样 `from model import ...` 才能找到模块。
 #
 #   D:\\Kronos\\.venv-gold\\Scripts\\python.exe D:\\Kronos\\finetune_csv\\generate_signals.py --timeframe H1
 #   (log: D:\\Kronos\\finetune_csv\\signals\\signals_H1.csv)
@@ -43,9 +43,9 @@ GOLD = {
     "tokenizer_id": os.path.join(BASE_DIR, "finetune_csv", "finetuned",
                                  "XAUUSD_all_timeframes_base", "tokenizer", "best_model"),
 }
-LOOKBACK = 400  # matches live: /api/ea_signal default lookback (8077 UI also 400)
-PRED_LEN = 12    # matches live: bridge asks pred_len=12, signal uses 12th bar
-HORIZON = 12  # signal uses the 12th predicted bar
+LOOKBACK = 400  # 与实盘一致：/api/ea_signal 默认 lookback（8077 界面也是 400）
+PRED_LEN = 12    # 与实盘一致：桥请求 pred_len=12，信号用第 12 根
+HORIZON = 12  # 信号用第 12 根预测 K 线
 
 
 def log(msg):
@@ -77,8 +77,8 @@ def main():
 
     cols = ["open", "high", "low", "close"] + (["volume"] if "volume" in val.columns else [])
     rows, t0 = [], time.time()
-    # Window start s: context = val[s:s+400]; future = val[s+400:s+412].
-    # The last context bar is a val bar; the 12 future bars are all val bars.
+    # 窗口起点 s：上下文 = val[s:s+400]；未来 = val[s+400:s+412]。
+    # 最后一根上下文 K 线是验证集里的 K 线；未来 12 根也全是验证集里的 K 线。
     last_start = len(val) - (LOOKBACK + PRED_LEN)
     for j, s in enumerate(range(0, last_start + 1, args.step)):
         x_df = val.iloc[s:s + LOOKBACK][cols].reset_index(drop=True)

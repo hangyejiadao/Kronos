@@ -1,31 +1,31 @@
 //+------------------------------------------------------------------+
 //|                                                KronosGoldEA.mq5  |
-//|  Gold EA driven by the fine-tuned Kronos-gold model (8077).       |
+//|  黄金 EA，由微调后的 Kronos-gold 模型驱动（8077）。                  |
 //|                                                                  |
-//|  Split of responsibilities (as requested):                       |
-//|    MQL5 EA  : data communication (WebRequest) + open/close        |
-//|               positions, risk management.                        |
-//|    Python   : 8077 /api/ea_signal runs the model, parses the      |
-//|               forecast bars and returns a flat signal JSON:      |
+//|  职责分工（按要求）：                                             |
+//|    MQL5 EA  ：数据通信（WebRequest）+ 开仓/平仓、风险管理。         |
+//|                                                                  |
+//|    Python   ：8077 的 /api/ea_signal 运行模型、解析预测 K 线，      |
+//|               返回一个扁平的信号 JSON：                             |
 //|               signal / change_pct / last_close / pred_close /    |
-//|               up_ratio / atr / sl_dist / tp_dist.                |
-//|               The EA only parses those few flat fields, it does  |
-//|               NOT parse the 120-bar forecast itself.             |
+//|               up_ratio / atr / sl_dist / tp_dist。                |
+//|               EA 只解析这几个扁平字段，不会自己解析 120 根预测 K 线。|
 //|                                                                  |
-//|  Flow: new H1 bar -> POST to 127.0.0.1:8077/api/ea_signal        |
-//|        -> LONG / SHORT / FLAT -> open, reverse or hold.           |
-//|  Python pulls the last 400 bars itself from the same MT5         |
-//|  terminal, so the EA does not need to send OHLC or dates.        |
 //|                                                                  |
-//|  !!! BEFORE USE !!!                                              |
-//|  1. MT5 -> Tools -> Options -> Expert Advisors -> tick            |
-//|     "Allow WebRequest for listed URL" and add:                   |
+//|  流程：新 H1 K 线收盘 -> POST 到 127.0.0.1:8077/api/ea_signal     |
+//|        -> LONG / SHORT / FLAT -> 开仓、反手或持有。                |
+//|  Python 自己从同一台 MT5 终端取最近 400 根 K 线，EA 不需要发送      |
+//|  OHLC 数据或日期。                                                |
+//|                                                                  |
+//|  !!! 使用前必读 !!!                                               |
+//|  1. MT5 -> 工具 -> 选项 -> EA 交易 -> 勾选                          |
+//|     “允许 WebRequest 的 URL 列表”，并添加：                         |
 //|        http://127.0.0.1:8077                                     |
-//|     Without this, WebRequest fails with error 4014.              |
-//|  2. 8077 must be running with the gold model loaded (it          |
-//|     auto-loads kronos-gold on CUDA at startup).                  |
-//|  3. Test on the DEMO account (Exness-MT5Trial5) first.           |
-//|     This EA has NOT been backtested yet.                         |
+//|     不加的话，WebRequest 会报 4014 错误。                          |
+//|  2. 8077 必须处于运行状态且已加载黄金模型（启动时会自动在 CUDA 上    |
+//|     加载 kronos-gold）。                                          |
+//|  3. 先在模拟账户（Exness-MT5Trial5）上测试。                       |
+//|     这个 EA 还没有回测过。                                        |
 //+------------------------------------------------------------------+
 #property copyright "Kronos Gold EA"
 #property version   "1.00"
@@ -34,29 +34,29 @@
 #include <Trade\Trade.mqh>
 CTrade trade;
 
-//--- Inputs
-input string   InpServerUrl      = "http://127.0.0.1:8077"; // 8077 Python server
-input string   InpSymbol         = "XAUUSDm";               // Gold symbol in MT5
-input ENUM_TIMEFRAMES InpTimeframe = PERIOD_H1;             // Signal timeframe
-input int      InpPredLen        = 12;                      // Bars the model predicts
-input int      InpHorizon        = 12;                      // Bar to judge direction on
-input double   InpThresholdPct   = 0.10;                    // Min |change| % to trade (0.10 = 0.10%)
-input double   InpRiskPercent    = 1.0;                     // % of balance risked per trade
-input double   InpSL_ATR         = 1.5;                     // Stop loss = ATR * this
-input double   InpTP_ATR         = 3.0;                     // Take profit = ATR * this
-input int      InpATRPeriod      = 14;                      // ATR period (EA-side check)
-input int      InpMaxSpreadPoints = 60;                     // Max spread in points, 0 = no limit
-input ulong    InpMagic          = 20261111;                // Magic number
-input string   InpTradeComment   = "KronosGold";            // Order comment
+//--- 输入参数
+input string   InpServerUrl      = "http://127.0.0.1:8077"; // 8077 Python 服务端地址
+input string   InpSymbol         = "XAUUSDm";               // MT5 里的黄金品种
+input ENUM_TIMEFRAMES InpTimeframe = PERIOD_H1;             // 信号周期
+input int      InpPredLen        = 12;                      // 模型每次预测的 K 线根数
+input int      InpHorizon        = 12;                      // 用第几根预测 K 线判断方向
+input double   InpThresholdPct   = 0.10;                    // 触发交易的最小涨跌幅 %（0.10 = 0.10%）
+input double   InpRiskPercent    = 1.0;                     // 每笔交易承担的账户余额风险 %
+input double   InpSL_ATR         = 1.5;                     // 止损 = ATR × 该倍数
+input double   InpTP_ATR         = 3.0;                     // 止盈 = ATR × 该倍数
+input int      InpATRPeriod      = 14;                      // ATR 周期（EA 端校验用）
+input int      InpMaxSpreadPoints = 60;                     // 最大点差（点），0 = 不限制
+input ulong    InpMagic          = 20261111;                // Magic 号
+input string   InpTradeComment   = "KronosGold";            // 订单备注
 input bool     InpAllowLong      = true;
 input bool     InpAllowShort     = true;
-input bool     InpCloseOnOpposite = true;                   // Close + reverse on opposite signal
-input int      InpRequestTimeoutMs = 120000;                // WebRequest timeout (model ~10-20s)
+input bool     InpCloseOnOpposite = true;                   // 出现反向信号时平仓并反手
+input int      InpRequestTimeoutMs = 120000;                // WebRequest 超时（模型约 10-20 秒）
 
 datetime g_lastBarTime = 0;
 
 //+------------------------------------------------------------------+
-//| Map ENUM_TIMEFRAMES to the string Python expects (M1/H1/...)     |
+//| 把 ENUM_TIMEFRAMES 映射成 Python 要求的字符串（M1/H1/……）          |
 //+------------------------------------------------------------------+
 string TimeframeToString(ENUM_TIMEFRAMES tf)
 {
@@ -75,8 +75,8 @@ string TimeframeToString(ENUM_TIMEFRAMES tf)
 }
 
 //+------------------------------------------------------------------+
-//| Flat-JSON helpers: the Python reply has no nested objects,       |
-//| so plain StringFind parsing is enough (no JSON library needed).  |
+//| 扁平 JSON 解析辅助函数：Python 返回的 JSON 没有嵌套对象，            |
+//| 直接用 StringFind 解析就够了（不需要 JSON 库）。                    |
 //+------------------------------------------------------------------+
 string ExtractString(const string &json, const string key)
 {
@@ -101,8 +101,8 @@ double ExtractDouble(const string &json, const string key)
 }
 
 //+------------------------------------------------------------------+
-//| Ask Python for a signal. Returns "" on failure.                  |
-//| Out params are filled from the flat JSON reply.                  |
+//| 向 Python 请求信号。失败时返回 ""。                                |
+//| 输出参数从扁平 JSON 回复中填充。                                   |
 //+------------------------------------------------------------------+
 string RequestSignal(double &change_pct, double &last_close, double &pred_close,
                      double &up_ratio, double &atr, double &sl_dist, double &tp_dist)
@@ -120,7 +120,7 @@ string RequestSignal(double &change_pct, double &last_close, double &pred_close,
    char post[], result[];
    string headers = "Content-Type: application/json\r\n";
    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-   if(ArraySize(post) > 0) ArrayResize(post, ArraySize(post) - 1); // drop trailing \0
+   if(ArraySize(post) > 0) ArrayResize(post, ArraySize(post) - 1); // 去掉末尾的 \0
 
    ResetLastError();
    int res = WebRequest("POST", url, NULL, NULL, InpRequestTimeoutMs, post, ArraySize(post), result, headers);
@@ -158,7 +158,7 @@ string RequestSignal(double &change_pct, double &last_close, double &pred_close,
 }
 
 //+------------------------------------------------------------------+
-//| Position helpers (only our own magic number counts)              |
+//| 持仓辅助函数（只认自己 Magic 号的持仓）                            |
 //+------------------------------------------------------------------+
 bool HasPosition(ENUM_POSITION_TYPE &type, double &volume)
 {
@@ -182,8 +182,8 @@ bool CloseMyPosition()
 }
 
 //+------------------------------------------------------------------+
-//| Lot size from fixed fractional risk: risk % of balance,           |
-//| stop distance in price -> loss per lot via tick value.           |
+//| 按固定比例风险算手数：每笔风险为余额的一定比例，                      |
+//| 止损距离（价格）-> 通过跳动值换算成每手亏损。                       |
 //+------------------------------------------------------------------+
 double CalcVolume(double sl_dist)
 {
@@ -206,7 +206,7 @@ double CalcVolume(double sl_dist)
 }
 
 //+------------------------------------------------------------------+
-//| ATR from the chart itself (sanity check / fallback for SL)       |
+//| 直接从图表取 ATR（合理性校验 / 止损的备用值）                       |
 //+------------------------------------------------------------------+
 double LocalATR()
 {
@@ -219,7 +219,7 @@ double LocalATR()
 }
 
 //+------------------------------------------------------------------+
-//| Execute one signal                                               |
+//| 执行一个信号                                                       |
 //+------------------------------------------------------------------+
 void ExecuteSignal(const string signal, double sl_dist, double tp_dist)
 {
@@ -231,7 +231,7 @@ void ExecuteSignal(const string signal, double sl_dist, double tp_dist)
    if(signal == "LONG" && !InpAllowLong)  { Print("KronosGold: LONG disabled by input."); return; }
    if(signal == "SHORT" && !InpAllowShort){ Print("KronosGold: SHORT disabled by input."); return; }
 
-   // Spread filter
+   // 点差过滤
    if(InpMaxSpreadPoints > 0)
    {
       long spread = SymbolInfoInteger(InpSymbol, SYMBOL_SPREAD);
@@ -257,7 +257,7 @@ void ExecuteSignal(const string signal, double sl_dist, double tp_dist)
       if(!CloseMyPosition()) return;
    }
 
-   // Stop / target: prefer Python's ATR-based distances, fall back to local ATR
+   // 止损/止盈：优先用 Python 发来的基于 ATR 的距离，拿不到时用本地 ATR
    double atr = LocalATR();
    if(sl_dist <= 0 && atr > 0) sl_dist = atr * InpSL_ATR;
    if(tp_dist <= 0 && atr > 0) tp_dist = atr * InpTP_ATR;
@@ -293,7 +293,7 @@ void ExecuteSignal(const string signal, double sl_dist, double tp_dist)
 }
 
 //+------------------------------------------------------------------+
-//| Init                                                             |
+//| 初始化                                                           |
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -315,7 +315,7 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| OnTick: act once per new bar (H1 = once per hour)                |
+//| OnTick：每根新 K 线只执行一次（H1 = 每小时一次）                   |
 //+------------------------------------------------------------------+
 void OnTick()
 {

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-# Backtest replay for the Kronos-gold EA (CPU-only, fast).
-# Reads a price CSV (same format as D:\\Kronos\\finetune_csv\\data\\XAUUSD_<TF>.csv:
+# Kronos-gold EA 的回测重放（只用 CPU，很快）。
+# 读取价格 CSV（格式与 D:\\Kronos\\finetune_csv\\data\\XAUUSD_<TF>.csv 相同：
 #   timestamps,open,high,low,close,volume[,amount])
-# plus a signals cache CSV produced by generate_signals.py:
+# 再读取 generate_signals.py 生成的信号缓存 CSV：
 #   window_time,signal,pred_move_pct,pred_close_12,last_close
-#   (signal: +1 long / -1 short / 0 flat; window_time = last context bar time)
-# and replays bar by bar: one position at a time, ATR-based SL/TP, fixed-risk
-# sizing, spread + slippage charged on entry and exit. An opposite signal
-# closes the open position and reverses in the same bar (EA behaviour:
-# InpCloseOnOpposite=true). SL/TP distances use the same ATR the live
-# system uses: mean(high-low) over 14 bars ("proxy", the /api/ea_signal
-# number), unless --atr-mode true is passed.
+#   （signal：+1 做多 / -1 做空 / 0 空仓；window_time = 窗口里最后一根上下文 K 线的时间）
+# 然后逐根 K 线重放：同一时间只持一仓，按 ATR 设止损/止盈，按固定风险算仓位，
+# 开仓和平仓都要扣点差 + 滑点。出现反向信号时，平掉当前持仓并在同一根 K 线反手
+#（EA 的行为：InpCloseOnOpposite=true）。止损/止盈距离用实盘同一套 ATR：
+# 14 根 K 线的 high-low 均值（“proxy”，即 /api/ea_signal 发来的那个数），
+# 除非传了 --atr-mode true。
 #
-# Usage:
+#
+# 用法：
 #   python backtest.py --prices XAUUSD_H1.csv --signals signals_H1.csv \
 #       [--config ea_config.yaml] [--threshold-pct 0.0015] [--sl-mult 1.5] [--tp-mult 3.0]
-# PyYAML is optional: without it, defaults below are used and CLI flags override.
+# PyYAML 是可选的：没装的话就用下面的默认值，命令行参数可以覆盖。
 import argparse
 import math
 import sys
@@ -28,7 +28,7 @@ DEFAULTS = dict(
     sl_atr_mult=1.5, tp_atr_mult=3.0,
     risk_per_trade_pct=0.01, max_lot=1.0, min_lot=0.01, lot_step=0.01,
     spread_usd=0.35, slippage_usd=0.10, initial_equity_usd=10000.0,
-    contract_size=100.0,  # XAUUSD: 1 lot = 100 oz; $1 move = $100 per lot
+    contract_size=100.0,  # XAUUSD：1 手 = 100 盎司；价格动 1 美元 = 每手 100 美元
 )
 
 
@@ -46,13 +46,13 @@ def load_config(path):
 
 
 def atr(df, period, mode="proxy"):
-    """ATR distance used for SL/TP.
-    mode 'proxy' (default) = mean(high-low) over `period` bars -- exactly
-    what the live 8077 /api/ea_signal sends as `atr` (patch_ea_signal.py),
-    and what the WS EA uses for sl_dist/tp_dist. Gold H1 gaps are small,
-    so proxy and true ATR are close, but the backtest must use the live
-    number or its SL/TP distances will not match the EA's.
-    mode 'true' = classic Wilder true-range ATR (kept for comparison)."""
+    """用于止损/止盈的 ATR 距离。
+    mode 'proxy'（默认）= `period` 根 K 线的（最高价-最低价）均值——与实盘
+    8077 的 /api/ea_signal 发来的 `atr`（见 patch_ea_signal.py）完全一致，
+    也是 WS 版 EA 算 sl_dist/tp_dist 用的数。黄金 H1 的跳空很小，
+    所以近似 ATR 和真实 ATR 很接近，但回测必须用实盘那个数，
+    否则止损/止盈距离就和 EA 对不上了。
+    mode 'true' = 经典的 Wilder 真实波幅 ATR（留作对照）。"""
     if mode == "proxy":
         return (df["high"] - df["low"]).rolling(period, min_periods=1).mean()
     prev_close = df["close"].shift(1)
@@ -70,9 +70,9 @@ def round_lot(lot, step, lo, hi):
 
 
 def run(prices, signals, cfg):
-    """Replay. Signals are indexed by window_time (last context bar); a signal
-    takes effect at the OPEN of the next bar. Exits are checked intrabar in
-    order SL first, then TP (conservative when both are hit in one bar)."""
+    """重放。信号按 window_time（最后一根上下文 K 线）索引；信号在下一根 K 线
+    的开盘价生效。出场在 K 线内检查，先看止损、再看止盈（同一根 K 线同时触及
+    止损和止盈时，按止损算，偏保守）。"""
     df = prices.copy()
     df["timestamps"] = pd.to_datetime(df["timestamps"])
     df = df.sort_values("timestamps").reset_index(drop=True)
@@ -84,12 +84,12 @@ def run(prices, signals, cfg):
     equity = cfg["initial_equity_usd"]
     peak = equity
     max_dd = 0.0
-    pos = None  # dict(side, entry, sl, tp, lot, entry_idx)
+    pos = None  # 持仓字典：side、entry、sl、tp、lot、entry_idx
     trades = []
     equity_curve = []
 
     for i, row in df.iterrows():
-        # exit check on the current bar (uses this bar's high/low)
+        # 检查当前这根 K 线是否出场（用这根 K 线的最高价/最低价）
         if pos is not None:
             hit_sl = (row["low"] <= pos["sl"]) if pos["side"] == 1 else (row["high"] >= pos["sl"])
             hit_tp = (row["high"] >= pos["tp"]) if pos["side"] == 1 else (row["low"] <= pos["tp"])
@@ -99,17 +99,17 @@ def run(prices, signals, cfg):
             elif hit_tp:
                 exit_price, reason = pos["tp"], "tp"
             if exit_price is not None:
-                # exit cost: spread + slippage against the position
+                # 出场成本：按不利于持仓的方向扣点差 + 滑点
                 adj = exit_price - pos["side"] * (cfg["spread_usd"] + cfg["slippage_usd"])
                 pnl = pos["side"] * (adj - pos["entry"]) * cfg["contract_size"] * pos["lot"]
                 equity += pnl
                 trades.append({**pos, "exit": adj, "exit_idx": i, "reason": reason, "pnl": pnl})
                 pos = None
-        # entry / reversal: signal from the previous closed bar.
-        # Same-direction signal while holding: no-op (EA holds too).
-        # Opposite signal: close at this bar's open and reverse in the
-        # same bar -- matches the EA (InpCloseOnOpposite=true).
-        # FLAT (0): no new trade, hold until SL/TP.
+        # 开仓 / 反手：用上一根收盘 K 线的信号。
+        # 持仓时收到同向信号：什么都不做（EA 也是继续持有）。
+        # 反向信号：在这根 K 线的开盘价平仓并反手——与 EA 一致
+        #（InpCloseOnOpposite=true）。
+        # FLAT（0）：不开新仓，持有到止损/止盈。
         if i > 0:
             s = sig.get(df.loc[i - 1, "timestamps"], 0)
             if s in (1, -1):
@@ -131,7 +131,7 @@ def run(prices, signals, cfg):
                         pos = dict(side=int(s), entry=entry,
                                    sl=entry - s * sl_dist, tp=entry + s * tp_dist,
                                    lot=lot, entry_idx=i)
-        # mark-to-market at close for the equity curve
+        # 按收盘价算市值，画资金曲线
         mtm = equity
         if pos is not None:
             mtm += pos["side"] * (float(row["close"]) - pos["entry"]) \
@@ -139,7 +139,7 @@ def run(prices, signals, cfg):
         peak = max(peak, mtm)
         max_dd = max(max_dd, (peak - mtm) / peak if peak else 0.0)
         equity_curve.append(mtm)
-    if pos is not None:  # close any open position at the last close
+    if pos is not None:  # 在最后一根 K 线的收盘价平掉所有未平仓位
         adj = float(df.iloc[-1]["close"]) - pos["side"] * (cfg["spread_usd"] + cfg["slippage_usd"])
         pnl = pos["side"] * (adj - pos["entry"]) * cfg["contract_size"] * pos["lot"]
         equity += pnl
@@ -188,8 +188,8 @@ def main():
 
     prices = pd.read_csv(args.prices)
     signals = pd.read_csv(args.signals)
-    # threshold is applied here (cache stores raw pred_move_pct, so one cache
-    # serves every threshold sweep)
+    # 阈值在这里应用（缓存里存的是原始 pred_move_pct，所以一份缓存
+    # 可以供所有阈值扫参用）
     signals["signal"] = np.where(signals["pred_move_pct"] > cfg["threshold_pct"], 1,
                                  np.where(signals["pred_move_pct"] < -cfg["threshold_pct"], -1, 0))
     metrics, tdf = run(prices, signals, cfg)

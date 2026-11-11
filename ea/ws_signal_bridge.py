@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ws_signal_bridge.py -- Python side of the WebSocket EA link (runs on the host).
+ws_signal_bridge.py —— WebSocket EA 链路的 Python 端（在主机上运行）。
 
-Role: WebSocket CLIENT. The EA is the server (C++ DLL inside MT5).
-This bridge:
-  1. watches MT5 for a newly CLOSED H1 bar (cheap: 2 bars via MetaTrader5),
-  2. calls the local Flask 8077 /api/ea_signal -- Python there runs the
-     gold model and parses the forecast into a flat signal JSON,
-  3. pushes that JSON over WebSocket to the EA, which trades on it.
+角色：WebSocket 客户端。EA 是服务端（MT5 里的 C++ DLL）。
+本桥接程序：
+  1. 监听 MT5 新收盘的 H1 K 线（开销很小：用 MetaTrader5 只取 2 根 K 线），
+  2. 调用本地 Flask 8077 的 /api/ea_signal——那边的 Python 运行黄金模型，
+     把预测结果解析成扁平的信号 JSON，
+  3. 通过 WebSocket 把该 JSON 推给 EA，由 EA 执行交易。
 
-Pure standard library for the WebSocket client (socket/base64/hashlib):
-no `websockets` / `websocket-client` pip install needed.
+WebSocket 客户端只用标准库（socket/base64/hashlib）：
+不需要 pip 安装 `websockets` / `websocket-client`。
 
-Run with the export venv (it has MetaTrader5 + requests-free stdlib only):
+用导出环境的 venv 运行（里面有 MetaTrader5，只有标准库，没有 requests）：
     D:\\Kronos\\.venv-gold\\Scripts\\python.exe D:\\Kronos\\ea\\ws_signal_bridge.py
-    D:\\Kronos\\.venv-gold\\Scripts\\python.exe D:\\Kronos\\ea\\ws_signal_bridge.py --once   (one bar, for testing)
+    D:\\Kronos\\.venv-gold\\Scripts\\python.exe D:\\Kronos\\ea\\ws_signal_bridge.py --once   （只推一根 K 线，用于测试）
 
-Keep this file in D:\\Kronos\\ea\\ -- NOT in D:\\Kronos\\webui\\ (Flask
-reloader watches that folder).
+本文件放在 D:\\Kronos\\ea\\——不要放进 D:\\Kronos\\webui\\（Flask
+的重载器会监听那个文件夹）。
 """
 
 import argparse
@@ -51,7 +51,7 @@ def log(msg):
 
 
 # ---------------------------------------------------------------------------
-# Minimal WebSocket client (RFC 6455, text frames only, stdlib only)
+# 极简 WebSocket 客户端（RFC 6455，只处理文本帧，只用标准库）
 # ---------------------------------------------------------------------------
 class WsClient:
     def __init__(self, host, port, path="/"):
@@ -91,7 +91,7 @@ class WsClient:
 
     def send_text(self, text):
         payload = text.encode("utf-8")
-        header = bytearray([0x81])  # FIN + text, masked (clients MUST mask)
+        header = bytearray([0x81])  # FIN + 文本帧，已加掩码（客户端必须加掩码）
         n = len(payload)
         if n < 126:
             header.append(0x80 | n)
@@ -107,7 +107,7 @@ class WsClient:
         self.sock.sendall(bytes(header) + masked)
 
     def recv_text(self, timeout=5):
-        """One text frame, or None on timeout. Answers pings with pongs."""
+        """读取一个文本帧，超时返回 None。收到 ping 会回 pong。"""
         self.sock.settimeout(timeout)
         try:
             hdr = self._recv_exact(2)
@@ -121,7 +121,7 @@ class WsClient:
         elif length == 127:
             length = struct.unpack(">Q", self._recv_exact(8))[0]
         payload = self._recv_exact(length) if length else b""
-        if opcode == 0x9:  # ping -> pong
+        if opcode == 0x9:  # ping -> 回 pong
             self.sock.sendall(bytes([0x8A, len(payload)]) + payload)
             return self.recv_text(timeout)
         if opcode == 0x8:
@@ -141,7 +141,7 @@ class WsClient:
 
 
 # ---------------------------------------------------------------------------
-# MT5: last CLOSED bar time (cheap, no model involved)
+# MT5：最新收盘 K 线的时间（开销很小，不涉及模型）
 # ---------------------------------------------------------------------------
 def last_closed_bar_time(mt5, symbol, timeframe):
     tf = getattr(mt5, "TIMEFRAME_" + timeframe, None)
@@ -150,7 +150,7 @@ def last_closed_bar_time(mt5, symbol, timeframe):
     rates = mt5.copy_rates_from_pos(symbol, tf, 0, 2)
     if rates is None or len(rates) < 2:
         return None
-    return int(rates[1]["time"])  # [1] = last closed bar; [0] is still forming
+    return int(rates[1]["time"])  # [1] = 最新收盘的 K 线；[0] 是还在走的 K 线
 
 
 def call_ea_signal():
@@ -186,7 +186,7 @@ def main():
     ws = None
     try:
         while True:
-            # --- (re)connect WS to the EA server ---
+            # --- （重新）连接 EA 的 WS 服务端 ---
             if ws is None:
                 try:
                     ws = WsClient(WS_HOST, args.ws_port)
@@ -197,7 +197,7 @@ def main():
                     time.sleep(10)
                     continue
 
-            # --- new closed bar? ---
+            # --- 有新收盘的 K 线吗？ ---
             try:
                 bar_time = last_closed_bar_time(mt5, SYMBOL, TIMEFRAME)
             except Exception as e:
@@ -233,7 +233,7 @@ def main():
                 time.sleep(5)
                 continue
             last_pushed = bar_time
-            # read any EA ack/status waiting (non-blocking-ish, 2s)
+            # 读一下 EA 回发的确认/状态（基本是非阻塞的，等 2 秒）
             try:
                 reply = ws.recv_text(timeout=2)
                 if reply:

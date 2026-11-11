@@ -1,30 +1,30 @@
 //+------------------------------------------------------------------+
 //|                                            KronosGoldEA_WS.mq5   |
-//|  Gold EA, WebSocket version.                                       |
+//|  黄金 EA，WebSocket 版。                                            |
 //|                                                                  |
-//|  Architecture (as requested):                                    |
-//|    EA = WebSocket SERVER. A C++ DLL (KronosWsServer.dll,          |
-//|    loaded by this EA) starts the WS server on 127.0.0.1:8081.    |
-//|    Python is the WS CLIENT (ws_signal_bridge.py): on each newly   |
-//|    closed H1 bar it asks 8077 /api/ea_signal for a signal --      |
-//|    Python runs the gold model and parses the forecast there --    |
-//|    then pushes the flat signal JSON to the EA over the socket.    |
-//|    This EA polls the DLL, and on a new signal it opens / closes   |
-//|    positions with the same risk rules as the HTTP version.        |
+//|  架构（按要求）：                                                   |
+//|    EA = WebSocket 服务端。C++ DLL（KronosWsServer.dll，             |
+//|    由本 EA 加载）在 127.0.0.1:8081 上启动 WS 服务。                  |
+//|    Python 是 WS 客户端（ws_signal_bridge.py）：每根新的 H1 K 线      |
+//|    收盘后，它向 8077 的 /api/ea_signal 请求信号——                    |
+//|    Python 在那边运行黄金模型并解析预测结果——                          |
+//|    然后把扁平的信号 JSON 通过 socket 推给 EA。                       |
+//|    本 EA 轮询 DLL，收到新信号后按与 HTTP 版相同的风控规则开仓/平仓。  |
 //|                                                                  |
-//|  Why C++ for the server, not C#: MQL5 #import can only load a     |
-//|  NATIVE DLL directly. A C# assembly would need an extra C++/CLI   |
-//|  wrapper to be callable from MQL5, so the server is plain C++.    |
 //|                                                                  |
-//|  Setup:                                                          |
-//|  1. Compile KronosWsServer.cpp -> KronosWsServer.dll, copy to     |
-//|     MT5 data folder MQL5\Libraries\                              |
-//|  2. In MT5: Tools -> Options -> Expert Advisors -> tick           |
-//|     "Allow DLL imports". No WebRequest whitelist is needed now.   |
-//|  3. 8077 running (gold model), then start ws_signal_bridge.py    |
-//|     on the host; it connects to this EA and pushes signals.       |
-//|  4. Attach this EA to the XAUUSDm H1 chart, allow Algo Trading.   |
-//|  Demo account first: this signal logic is NOT backtested yet.    |
+//|  服务端为什么用 C++ 而不用 C#：MQL5 的 #import 只能直接加载           |
+//|  原生 DLL。C# 程序集需要额外包一层 C++/CLI 才能被 MQL5 调用，         |
+//|  所以服务端直接用纯 C++ 写。                                        |
+//|                                                                  |
+//|  部署步骤：                                                        |
+//|  1. 编译 KronosWsServer.cpp -> KronosWsServer.dll，复制到           |
+//|     MT5 数据文件夹的 MQL5\Libraries\                              |
+//|  2. 在 MT5 里：工具 -> 选项 -> EA 交易 -> 勾选                       |
+//|     “允许 DLL 导入”。现在不再需要 WebRequest 白名单。                |
+//|  3. 8077 保持运行（黄金模型），然后在主机上启动 ws_signal_bridge.py，|
+//|     它会连上本 EA 并推送信号。                                      |
+//|  4. 把本 EA 挂到 XAUUSDm 的 H1 图表上，允许算法交易。                |
+//|  先跑模拟账户：这套信号逻辑还没有回测过。                            |
 //+------------------------------------------------------------------+
 #property copyright "Kronos Gold EA (WebSocket)"
 #property version   "2.00"
@@ -33,7 +33,7 @@
 #include <Trade\Trade.mqh>
 CTrade trade;
 
-//--- DLL: WebSocket server started inside the MT5 process
+//--- DLL：在 MT5 进程内启动的 WebSocket 服务端
 #import "KronosWsServer.dll"
 int    WsStart(int port);
 void   WsStop();
@@ -44,15 +44,15 @@ int    WsGetSignal(char &buffer[], int bufferSize);
 int    WsSendText(const char &msg[], int len);
 #import
 
-//--- Inputs (trading only -- no HTTP settings any more)
+//--- 输入参数（只管交易，不再有 HTTP 相关设置）
 input string   InpSymbol          = "XAUUSDm";
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_H1;
-input int      InpWsPort          = 8081;      // WS server port (localhost only)
-input double   InpRiskPercent     = 1.0;       // % of balance risked per trade
-input double   InpSL_ATR          = 1.5;       // Stop loss = ATR * this
-input double   InpTP_ATR          = 3.0;       // Take profit = ATR * this
+input int      InpWsPort          = 8081;      // WS 服务端口（仅本机）
+input double   InpRiskPercent     = 1.0;       // 每笔交易承担的账户余额风险 %
+input double   InpSL_ATR          = 1.5;       // 止损 = ATR × 该倍数
+input double   InpTP_ATR          = 3.0;       // 止盈 = ATR × 该倍数
 input int      InpATRPeriod       = 14;
-input int      InpMaxSpreadPoints = 60;        // Max spread in points, 0 = no limit
+input int      InpMaxSpreadPoints = 60;        // 最大点差（点），0 = 不限制
 input ulong    InpMagic           = 20261111;
 input string   InpTradeComment    = "KronosGoldWS";
 input bool     InpAllowLong       = true;
@@ -62,7 +62,7 @@ input bool     InpCloseOnOpposite = true;
 string g_lastSignalBarTime = "";
 
 //+------------------------------------------------------------------+
-//| Flat-JSON helpers (Python sends a flat object, no nesting)       |
+//| 扁平 JSON 解析辅助函数（Python 发来的是扁平对象，没有嵌套）          |
 //+------------------------------------------------------------------+
 string ExtractString(const string &json, const string key)
 {
@@ -103,7 +103,7 @@ string TimeframeToString(ENUM_TIMEFRAMES tf)
 }
 
 //+------------------------------------------------------------------+
-//| Position helpers (only our own magic number counts)              |
+//| 持仓辅助函数（只认自己 Magic 号的持仓）                            |
 //+------------------------------------------------------------------+
 bool HasPosition(ENUM_POSITION_TYPE &type, double &volume)
 {
@@ -156,7 +156,7 @@ double LocalATR()
 }
 
 //+------------------------------------------------------------------+
-//| Execute one signal (same rules as the HTTP version)              |
+//| 执行一个信号（与 HTTP 版规则相同）                                 |
 //+------------------------------------------------------------------+
 void ExecuteSignal(const string signal, double sl_dist, double tp_dist)
 {
@@ -219,8 +219,7 @@ void ExecuteSignal(const string signal, double sl_dist, double tp_dist)
       PrintFormat("KronosGoldWS: order failed, error=%d", GetLastError());
 }
 
-// Send a short status back to Python over the same socket (optional,
-// best-effort: failures are ignored).
+// 通过同一条 socket 把简短状态回发给 Python（可选，尽力而为，失败忽略）。
 void SendStatus(const string bar_time)
 {
    ENUM_POSITION_TYPE t; double v;
@@ -236,7 +235,7 @@ void SendStatus(const string bar_time)
 }
 
 //+------------------------------------------------------------------+
-//| Drain all queued WS messages and act on each new signal          |
+//| 取出队列里所有 WS 消息，对每个新信号执行操作                         |
 //+------------------------------------------------------------------+
 void PollWebSocket()
 {
@@ -281,7 +280,7 @@ void PollWebSocket()
 }
 
 //+------------------------------------------------------------------+
-//| Init / Deinit / Tick                                             |
+//| 初始化 / 反初始化 / 逐笔报价                                       |
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -302,7 +301,7 @@ int OnInit()
                (started == 0) ? "already running" : "started",
                InpRiskPercent);
    Print("KronosGoldWS: waiting for ws_signal_bridge.py to connect and push signals.");
-   EventSetTimer(60);  // heartbeat: re-check the server is alive
+   EventSetTimer(60);  // 心跳：定期检查服务端是否还活着
    return INIT_SUCCEEDED;
 }
 
@@ -318,7 +317,7 @@ void OnTimer()
    if(WsIsRunning() == 0)
       Print("KronosGoldWS: WARNING - WS server not running (DLL unloaded or stopped).");
    else
-      PollWebSocket();  // also drain on the timer in case ticks are sparse
+      PollWebSocket();  // 定时器里也取一次，以防报价稀疏时漏掉消息
 }
 
 void OnTick()
